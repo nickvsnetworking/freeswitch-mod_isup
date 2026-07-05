@@ -911,10 +911,15 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 		}
 	}
 
-	user = osmo_ss7_user_create(inst, "isup");
-	osmo_ss7_user_set_prim_cb(user, isup_prim_cb);
-	osmo_ss7_user_set_priv(user, p);
-	osmo_ss7_user_register(user, MTP_SI_ISUP);
+	/* osmo_ss7_user is a caller-owned struct: allocate it, fill it, and
+	 * register it against the instance for the ISUP service indicator (SI=5). */
+	user = talloc_zero(g.tall, struct osmo_ss7_user);
+	if (!user) return -1;
+	user->inst = inst;
+	user->name = "isup";
+	user->prim_cb = isup_prim_cb;
+	user->priv = p;
+	osmo_ss7_user_register(inst, MTP_SI_ISUP, user);
 
 	p->m3ua.inst = inst;
 	p->m3ua.ss7_user = user;
