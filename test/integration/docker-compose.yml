@@ -1,0 +1,58 @@
+# mod_isup end-to-end integration lab.
+#
+# Brings up the SIGTRAN + bearer infrastructure mod_isup needs so call
+# scenarios can be driven against a real M3UA STP and a real MGW. The
+# FreeSWITCH+mod_isup container is built from the repo; the "peer" container
+# originates/terminates ISUP to exercise both call directions.
+#
+#   docker compose up -d osmo-stp osmo-mgw
+#   docker compose run --rm scenarios     # runs the scenario suite
+#
+# Networks use fixed point codes so the routing is deterministic.
+
+version: "3.8"
+
+services:
+  # M3UA signalling gateway / STP — routes ISUP between mod_isup and the peer.
+  osmo-stp:
+    image: osmocom/osmo-stp:latest
+    volumes:
+      - ./osmo-stp.cfg:/data/osmo-stp.cfg:ro
+    command: ["osmo-stp", "-c", "/data/osmo-stp.cfg"]
+    ports:
+      - "2905:2905/sctp"     # M3UA
+    networks: [ss7]
+
+  # Media gateway — fronts the TDM<->IP bearer, relays RTP to FreeSWITCH.
+  osmo-mgw:
+    image: osmocom/osmo-mgw:latest
+    volumes:
+      - ./osmo-mgw.cfg:/data/osmo-mgw.cfg:ro
+    command: ["osmo-mgw", "-c", "/data/osmo-mgw.cfg"]
+    ports:
+      - "2427:2427/udp"      # MGCP
+    networks: [ss7]
+
+  # FreeSWITCH with mod_isup (built from this repo).
+  freeswitch:
+    build:
+      context: ../../..
+      dockerfile: mod_isup/test/integration/Dockerfile.fs
+    depends_on: [osmo-stp, osmo-mgw]
+    volumes:
+      - ./isup.conf.xml:/usr/local/freeswitch/conf/autoload_configs/isup.conf.xml:ro
+    networks: [ss7]
+
+  # Peer ISUP exchange — a second osmo_ss7 ASP that places & receives calls,
+  # driving the scenario suite (see scenarios/).
+  scenarios:
+    build:
+      context: .
+      dockerfile: Dockerfile.peer
+    depends_on: [osmo-stp, freeswitch]
+    networks: [ss7]
+    command: ["/scenarios/run.sh"]
+
+networks:
+  ss7:
+    driver: bridge

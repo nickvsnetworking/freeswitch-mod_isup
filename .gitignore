@@ -1,0 +1,23 @@
+# build artifacts
+*.o
+*.so
+*.so.*
+build/
+mod_isup.so
+# compiled unit tests
+test/test_codec
+test/test_sm
+test/test_segment
+test/test_map
+test/test_e2e
+test/test_cgm
+test/test_hardening
+test/test_trace
+test/isup_fuzz
+test/*_plain
+test/corpus/
+# compiled live tools
+test/live/fs_harness
+test/live/m3ua_node
+test/live/stubs/
+# captures are kept as demo artifacts (docker/captures/*.pcap)

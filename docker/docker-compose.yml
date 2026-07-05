@@ -1,0 +1,64 @@
+# Three-container ISUP lab: two FreeSWITCH/mod_isup exchanges calling each
+# other over M3UA through an osmo-stp, with bearer on osmo-mgw.
+#
+#   cd mod_isup/docker
+#   docker compose build
+#   docker compose up --abort-on-container-exit
+#
+# fs-a originates isup/lab/1002 -> STP routes IAM to fs-b -> fs-b auto-answers
+# -> ACM/ANM back to fs-a -> call answered -> fs-a releases.
+
+services:
+  sigtran:
+    build:
+      context: ../..
+      dockerfile: mod_isup/docker/Dockerfile.sigtran
+    image: isup-sigtran
+    networks:
+      ss7:
+        ipv4_address: 172.30.0.10
+
+  fs-b:                                   # terminating exchange (auto-answers)
+    build:
+      context: ../..
+      dockerfile: mod_isup/docker/Dockerfile.fs
+    image: isup-fs
+    depends_on: [sigtran]
+    environment:
+      ISUP_OPC: "2"
+      ISUP_PEER_DPC: "1"
+      ISUP_MGW: "172.30.0.10:2427"
+      ISUP_CS7_CFG: /mod_isup/docker/cs7-b.cfg
+      ISUP_ASP_NAME: asp-b
+      ISUP_SCCP_SSN: "8"
+    command: ["/mod_isup/fs_harness", "30"]
+    networks:
+      ss7:
+        ipv4_address: 172.30.0.12
+
+  fs-a:                                   # originating exchange
+    build:
+      context: ../..
+      dockerfile: mod_isup/docker/Dockerfile.fs
+    image: isup-fs
+    depends_on: [sigtran, fs-b]
+    environment:
+      ISUP_OPC: "1"
+      ISUP_PEER_DPC: "2"
+      ISUP_MGW: "172.30.0.10:2427"
+      ISUP_CS7_CFG: /mod_isup/docker/cs7-a.cfg
+      ISUP_ASP_NAME: asp-a
+      ISUP_SCCP_SSN: "8"
+      # settable IAM parameters exercised by the validation
+      ISUP_ORIG_VARS: "isup_tmr=3k1,isup_cpc=payphone,isup_fci=6011,isup_calling_number=61755500009,isup_calling_noa=international,isup_hop_counter=20,isup_nci=04"
+    command: ["/bin/sh", "-c", "sleep 3; exec /mod_isup/fs_harness 15 originate 1002"]
+    networks:
+      ss7:
+        ipv4_address: 172.30.0.11
+
+networks:
+  ss7:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

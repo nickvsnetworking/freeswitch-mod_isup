@@ -1,0 +1,19 @@
+# osmo-stp (M3UA STP) + osmo-mgw (MGW) in one container.
+FROM debian:bullseye-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates wget gnupg && rm -rf /var/lib/apt/lists/*
+
+RUN wget -qO /etc/apt/trusted.gpg.d/osmocom.asc \
+        "https://downloads.osmocom.org/packages/osmocom:/latest/Debian_11/Release.key" && \
+    echo "deb https://downloads.osmocom.org/packages/osmocom:/latest/Debian_11/ ./" \
+        > /etc/apt/sources.list.d/osmocom.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        osmo-stp osmo-mgw tcpdump && rm -rf /var/lib/apt/lists/*
+
+COPY mod_isup/docker/osmo-stp.cfg /osmo-stp.cfg
+COPY mod_isup/docker/osmo-mgw.cfg /osmo-mgw.cfg
+COPY mod_isup/docker/run-sigtran.sh /run-sigtran.sh
+RUN chmod +x /run-sigtran.sh
+
+CMD ["/run-sigtran.sh"]

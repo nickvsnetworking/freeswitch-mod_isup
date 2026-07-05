@@ -1,0 +1,29 @@
+<document type="freeswitch/xml">
+ <section name="configuration">
+  <configuration name="switch.conf" description="core">
+   <settings>
+    <param name="max-sessions" value="1000"/>
+    <param name="sessions-per-second" value="100"/>
+    <param name="rtp-start-port" value="16500"/>
+    <param name="rtp-end-port" value="16600"/>
+   </settings>
+  </configuration>
+ </section>
+
+ <!-- Inbound ISUP calls route here (mod_dialplan_xml). Proper flow:
+      ring_ready -> ACM (alerting), answer -> ANM, then in-band media. -->
+ <section name="dialplan" description="XML dialplan">
+  <context name="default">
+   <extension name="isup_inbound">
+    <condition field="destination_number" expression="^(\d+)$">
+     <action application="ring_ready"/>
+     <action application="sleep" data="1000"/>
+     <action application="answer"/>
+     <action application="gentones" data="%(2000,0,440)"/>
+     <action application="sleep" data="2000"/>
+     <action application="hangup"/>
+    </condition>
+   </extension>
+  </context>
+ </section>
+</document>

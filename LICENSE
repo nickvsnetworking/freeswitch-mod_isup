@@ -1,0 +1,18 @@
+mod_isup — FreeSWITCH ISUP-over-M3UA MGCF
+
+SPDX-License-Identifier: GPL-2.0-or-later
+
+Copyright (C) 2026 Nick (nickvsnetworking)
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+Rationale: this module links against libosmocore / libosmo-sigtran, which are
+GPL-2.0-or-later. The combined work is therefore GPL. FreeSWITCH core is MPL-1.1;
+this module is deliberately a separate, out-of-tree loadable module so the GPL
+boundary stays clean.
+
+Before public release, replace this file with the full text of the GNU General
+Public License version 2 (https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt).
