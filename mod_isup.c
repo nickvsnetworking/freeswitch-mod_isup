@@ -811,8 +811,9 @@ static switch_io_routines_t isup_io_routines = {
 static struct osmo_ss7_asp *isup_find_asp(void)
 {
 	if (!g.profile || !g.profile->m3ua.inst || !g.asp_name[0]) return NULL;
-	return osmo_ss7_asp_find2(g.profile->m3ua.inst, g.asp_name, 2905, 0,
-				  IPPROTO_SCTP, OSMO_SS7_ASP_PROT_M3UA);
+	/* By name, so the ASP's SCTP local (source) port is free to be pinned in
+	 * the cs7 config (needed to run two exchanges off one source IP). */
+	return osmo_ss7_asp_find_by_name(g.profile->m3ua.inst, g.asp_name);
 }
 
 SWITCH_STANDARD_API(isup_api_function)
@@ -904,8 +905,8 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 	{
 		const char *aspname = getenv("ISUP_ASP_NAME");
 		if (aspname) {
-			struct osmo_ss7_asp *asp = osmo_ss7_asp_find2(
-				inst, aspname, 2905, 0, IPPROTO_SCTP, OSMO_SS7_ASP_PROT_M3UA);
+			struct osmo_ss7_asp *asp =
+				osmo_ss7_asp_find_by_name(inst, aspname);
 			if (asp)
 				osmo_ss7_asp_restart(asp);
 		}
