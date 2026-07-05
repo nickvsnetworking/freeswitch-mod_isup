@@ -4,9 +4,10 @@ A FreeSWITCH ISUP-over-M3UA MGCF (Media Gateway Control Function). It bridges
 SS7 ISUP calls — carried over M3UA/SCTP via `libosmo-sigtran` — to and from
 FreeSWITCH, with the bearer controlled over MGCP against an `osmo-mgw`.
 
-See [`docs/mod_isup_design.md`](docs/mod_isup_design.md) for the full
-architecture; this README covers what is built, how to build it, and how to
-test it.
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the operations guide
+(configuration, `fs_cli` commands, and call routing), and
+[`docs/mod_isup_design.md`](docs/mod_isup_design.md) for the full architecture.
+This README covers what is built, how to build it, and how to test it.
 
 ## Layout
 
