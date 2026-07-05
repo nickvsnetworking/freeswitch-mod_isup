@@ -1,15 +1,16 @@
 /*
  * mod_isup — M3UA transport binding (libosmo-sigtran).
  *
- * Verified to compile against libosmo-sigtran 2.x (osmo_ss7 user SAP). The
- * SI=5 MTP-User registration is the mechanism the design relies on so that
- * ISUP rides M3UA directly, sharing the association with SCCP (SI=3).
+ * Uses the osmo_ss7 MTP user SAP: a caller-owned struct osmo_ss7_user is
+ * registered against the instance for the ISUP service indicator (SI=5), so
+ * that ISUP rides M3UA directly, sharing the association with SCCP (SI=3).
  */
 #include <string.h>
 #include <errno.h>
 
 #include <osmocom/core/msgb.h>
 #include <osmocom/core/prim.h>
+#include <osmocom/core/talloc.h>
 
 #include <osmocom/sigtran/osmo_ss7.h>
 #include <osmocom/sigtran/mtp_sap.h>
@@ -69,13 +70,17 @@ int isup_m3ua_init(struct isup_m3ua *m, void *talloc_ctx, uint32_t id,
 	/* ITU 14-bit point codes: 3-8-3 sub-field structure. */
 	osmo_ss7_instance_set_pc_fmt(m->inst, 3, 8, 3);
 
-	m->ss7_user = osmo_ss7_user_create(m->inst, "isup");
+	/* osmo_ss7_user is a plain caller-owned struct: allocate, fill, and
+	 * register it against the instance for the ISUP service indicator. */
+	m->ss7_user = talloc_zero(talloc_ctx, struct osmo_ss7_user);
 	if (!m->ss7_user)
 		return -ENOMEM;
-	osmo_ss7_user_set_prim_cb(m->ss7_user, isup_m3ua_prim_cb);
-	osmo_ss7_user_set_priv(m->ss7_user, m);
+	m->ss7_user->inst = m->inst;
+	m->ss7_user->name = "isup";
+	m->ss7_user->prim_cb = isup_m3ua_prim_cb;
+	m->ss7_user->priv = m;
 
-	if (osmo_ss7_user_register(m->ss7_user, MTP_SI_ISUP) < 0)
+	if (osmo_ss7_user_register(m->inst, MTP_SI_ISUP, m->ss7_user) < 0)
 		return -EEXIST;
 
 	return 0;
@@ -108,14 +113,14 @@ int isup_m3ua_send(struct isup_m3ua *m, uint32_t dpc, uint8_t sls,
 	msg->l2h = msgb_put(msg, len);
 	memcpy(msg->l2h, data, len);
 
-	return osmo_ss7_user_mtp_sap_prim_down(m->ss7_user, prim);
+	return osmo_ss7_user_mtp_xfer_req(m->inst, prim);
 }
 
 void isup_m3ua_fini(struct isup_m3ua *m)
 {
 	if (m->ss7_user) {
-		osmo_ss7_user_unregister(m->ss7_user, MTP_SI_ISUP);
-		osmo_ss7_user_destroy(m->ss7_user);
+		osmo_ss7_user_unregister(m->inst, MTP_SI_ISUP, m->ss7_user);
+		talloc_free(m->ss7_user);
 		m->ss7_user = NULL;
 	}
 }
