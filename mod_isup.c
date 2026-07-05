@@ -876,8 +876,8 @@ SWITCH_STANDARD_API(isup_api_function)
 /* Module load / unload                                                */
 /* ------------------------------------------------------------------ */
 
-static const struct log_info_cat g_log_cats[] = {};
-static const struct log_info g_log_info = { .cat = g_log_cats, .num_cat = 0 };
+/* No module-specific log categories; osmo's own defaults still register. */
+static const struct log_info g_log_info = { .cat = NULL, .num_cat = 0 };
 static struct vty_app_info g_vty_info = { .name = "mod_isup", .version = "0" };
 
 static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
@@ -1016,9 +1016,11 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 	/* Launch the Osmo thread; it performs all osmo setup then runs the loop.
 	 * Wait (briefly) until it signals ready so outbound calls find state. */
 	g.running = 1;
-	switch_threadattr_t *ta;
-	switch_threadattr_create(&ta, pool);
-	switch_thread_create(&g.osmo_thread, ta, osmo_thread_run, NULL, pool);
+	{
+		switch_threadattr_t *ta;
+		switch_threadattr_create(&ta, pool);
+		switch_thread_create(&g.osmo_thread, ta, osmo_thread_run, NULL, pool);
+	}
 	{
 		int spins = 0;
 		while (!g.ready && spins++ < 300)

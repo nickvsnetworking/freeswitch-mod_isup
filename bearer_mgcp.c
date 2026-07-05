@@ -87,14 +87,16 @@ static const char *hdr(const char *resp, const char *key, char *out, size_t cap)
 static int bm_crcx(const char *gateway, const char *endpoint, const char *mode,
 		   bearer_ready_cb cb, void *user, struct bearer_ci **out)
 {
+	static uint32_t callseq;
 	struct bearer_ci *ci = calloc(1, sizeof(*ci));
 	char req[512], resp[2048], tmp[128];
 	const char *ep = (endpoint && *endpoint) ? endpoint : "rtpbridge/*@mgw";
+	const char *opc_env = getenv("ISUP_OPC");
+	unsigned inst;
 	int code;
 
 	if (!ci)
 		return -1;
-	static uint32_t callseq;
 	/* osmo-mgw's rtpbridge endpoint bridges the two connections that belong
 	 * to ONE call (one CallId, two connection-ids). The two exchanges are
 	 * independent MGCF instances, so we must agree on a CallId derived from
@@ -103,14 +105,13 @@ static int bm_crcx(const char *gateway, const char *endpoint, const char *mode,
 	 * with 516 (incorrect CallId). The MGCP transaction-id stays unique per
 	 * instance (mix in ISUP_OPC) so the MGW does not mistake the second
 	 * leg's CRCX for a retransmission of the first. */
-	const char *opc_env = getenv("ISUP_OPC");
-	unsigned inst = (unsigned)((opc_env ? atoi(opc_env) : 0) & 0xffff);
+	inst = (unsigned)((opc_env ? atoi(opc_env) : 0) & 0xffff);
 	if (!inst) inst = (unsigned)(getpid() & 0xffff);
 	ci->sock = socket(AF_INET, SOCK_DGRAM, 0);
 	parse_gw(gateway, &ci->dst);
 	ci->txid = (inst << 16) | ((++callseq) & 0xffff);
 	{
-		char cid[32]; size_t k = 0;
+		char cid[24]; size_t k = 0; /* "isup" + cid must fit ci->callid */
 		for (const char *s = ep; *s && k < sizeof(cid) - 1; s++)
 			if ((*s >= 'a' && *s <= 'z') || (*s >= '0' && *s <= '9'))
 				cid[k++] = *s;
