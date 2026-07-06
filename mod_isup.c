@@ -903,7 +903,7 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 
 	/* Kick the configured (client) ASP into connecting to the STP. */
 	{
-		const char *aspname = getenv("ISUP_ASP_NAME");
+		const char *aspname = g.asp_name[0] ? g.asp_name : NULL;
 		if (aspname) {
 			struct osmo_ss7_asp *asp =
 				osmo_ss7_asp_find_by_name(inst, aspname);
@@ -966,19 +966,73 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 	return 0;
 }
 
+/* Load settings from autoload_configs/isup.conf.xml. The XML file is the
+ * canonical configuration; same-named ISUP_* environment variables override it
+ * (convenient for containerised deployments). */
+static void isup_load_config(isup_profile_t *p)
+{
+	switch_xml_t xml, cfg, settings, param;
+	const char *cs7 = NULL, *asp = NULL, *mgw = NULL, *ctx = NULL, *dp = NULL, *name = NULL;
+	const char *env;
+
+	p->m3ua.opc = 1;
+	p->peer_dpc = 2;
+	p->m3ua.ni  = 2;               /* national */
+	p->cic_min  = 1;
+	p->cic_max  = 4;
+	g.autoanswer = 0;
+	g.sccp_ssn   = 0;
+
+	if ((xml = switch_xml_open_cfg("isup.conf", &cfg, NULL))) {
+		if ((settings = switch_xml_child(cfg, "settings"))) {
+			for (param = switch_xml_child(settings, "param"); param; param = param->next) {
+				const char *var = switch_xml_attr_soft(param, "name");
+				const char *val = switch_xml_attr_soft(param, "value");
+				if      (!strcasecmp(var, "profile-name"))      name = val;
+				else if (!strcasecmp(var, "cs7-config"))        cs7  = val;
+				else if (!strcasecmp(var, "asp-name"))          asp  = val;
+				else if (!strcasecmp(var, "opc"))               p->m3ua.opc = (uint32_t)atoi(val);
+				else if (!strcasecmp(var, "peer-dpc"))          p->peer_dpc = (uint32_t)atoi(val);
+				else if (!strcasecmp(var, "mgw"))               mgw  = val;
+				else if (!strcasecmp(var, "network-indicator")) p->m3ua.ni = (uint8_t)atoi(val);
+				else if (!strcasecmp(var, "cic-min"))           p->cic_min = (uint16_t)atoi(val);
+				else if (!strcasecmp(var, "cic-max"))           p->cic_max = (uint16_t)atoi(val);
+				else if (!strcasecmp(var, "context"))           ctx  = val;
+				else if (!strcasecmp(var, "dialplan"))          dp   = val;
+				else if (!strcasecmp(var, "auto-answer"))       g.autoanswer = switch_true(val);
+				else if (!strcasecmp(var, "sccp-ssn"))          g.sccp_ssn = atoi(val);
+			}
+		}
+		switch_xml_free(xml);
+	} else {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+				  "mod_isup: isup.conf.xml not found; using defaults + environment\n");
+	}
+
+	if ((env = getenv("ISUP_CS7_CFG")))  cs7 = env;
+	if ((env = getenv("ISUP_ASP_NAME"))) asp = env;
+	if ((env = getenv("ISUP_MGW")))      mgw = env;
+	if ((env = getenv("ISUP_OPC")))      p->m3ua.opc = (uint32_t)atoi(env);
+	if ((env = getenv("ISUP_PEER_DPC"))) p->peer_dpc = (uint32_t)atoi(env);
+	if (getenv("ISUP_AUTOANSWER"))       g.autoanswer = 1;
+	if ((env = getenv("ISUP_SCCP_SSN"))) g.sccp_ssn = atoi(env);
+
+	switch_copy_string(p->name,     name ? name : "lab", sizeof(p->name));
+	switch_copy_string(g.asp_name,  asp ? asp : "asp", sizeof(g.asp_name));
+	switch_copy_string(g.cs7_cfg,   cs7 ? cs7 : "/usr/local/freeswitch/conf/isup-cs7.cfg", sizeof(g.cs7_cfg));
+	switch_copy_string(p->gateway,  mgw ? mgw : "127.0.0.1:2427", sizeof(p->gateway));
+	switch_copy_string(p->context,  ctx ? ctx : "default", sizeof(p->context));
+	switch_copy_string(p->dialplan, dp ? dp : "XML", sizeof(p->dialplan));
+	if (p->cic_max < p->cic_min) p->cic_max = p->cic_min;
+}
+
 SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 {
 	switch_endpoint_interface_t *ep;
 	isup_profile_t *p;
-	const char *cs7_cfg = getenv("ISUP_CS7_CFG");
-	if (!cs7_cfg) cs7_cfg = "/usr/local/freeswitch/conf/isup-cs7.cfg";
 
 	memset(&g, 0, sizeof(g));
 	g.pool = pool;
-	g.autoanswer = getenv("ISUP_AUTOANSWER") ? 1 : 0;
-	g.sccp_ssn   = getenv("ISUP_SCCP_SSN") ? atoi(getenv("ISUP_SCCP_SSN")) : 0; /* 0 = SCCP off */
-	switch_copy_string(g.asp_name, getenv("ISUP_ASP_NAME") ? getenv("ISUP_ASP_NAME") : "asp",
-			   sizeof(g.asp_name));
 	switch_mutex_init(&g.qlock, SWITCH_MUTEX_NESTED, pool);
 
 	{
@@ -997,22 +1051,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 		switch_console_set_complete("add isup sccp");
 	}
 
-	/* Profile from environment so each container is its own exchange.
-	 * Production: parse isup.conf.xml. */
+	/* Configuration from autoload_configs/isup.conf.xml (ISUP_* env overrides). */
 	p = switch_core_alloc(pool, sizeof(*p));
-	switch_copy_string(p->name, "lab", sizeof(p->name));
-	switch_copy_string(p->gateway, getenv("ISUP_MGW") ? getenv("ISUP_MGW") : "127.0.0.1:2427",
-			   sizeof(p->gateway));
-	switch_copy_string(p->context, "default", sizeof(p->context));
-	switch_copy_string(p->dialplan, "XML", sizeof(p->dialplan));
-	p->cic_min = 1; p->cic_max = 4;
-	p->m3ua.opc = getenv("ISUP_OPC") ? (uint32_t)atoi(getenv("ISUP_OPC")) : 1;
-	p->m3ua.ni = 2;                         /* ITU national */
-	p->peer_dpc = getenv("ISUP_PEER_DPC") ? (uint32_t)atoi(getenv("ISUP_PEER_DPC")) : 2;
+	g.profile = p;
+	isup_load_config(p);
 	p->bearer = bearer_mgcp_driver();
 	p->ckt = switch_core_alloc(pool, sizeof(isup_ckt_t) * (p->cic_max - p->cic_min + 1));
-	g.profile = p;
-	switch_copy_string(g.cs7_cfg, cs7_cfg, sizeof(g.cs7_cfg));
 
 	/* Launch the Osmo thread; it performs all osmo setup then runs the loop.
 	 * Wait (briefly) until it signals ready so outbound calls find state. */

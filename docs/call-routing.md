@@ -50,7 +50,7 @@ originate isup/lab/1002 &echo
 
 On each outbound call the module selects the **first idle CIC** in the
 configured range (`1`–`4`). The IAM is routed to the profile's peer DPC
-(`ISUP_PEER_DPC`). If no circuit is idle, the call is rejected with
+(the `peer-dpc` setting). If no circuit is idle, the call is rejected with
 `NORMAL_CIRCUIT_CONGESTION`. If the start-up group reset has not completed, the
 call is rejected with `NORMAL_TEMPORARY_FAILURE` (Q.764 §2.9.1) — retry shortly.
 
@@ -164,7 +164,7 @@ cause.
 Which exchange a call reaches is determined by point codes, not by the dialled
 number alone:
 
-- Outbound IAM is addressed to **`ISUP_PEER_DPC`** and handed to the STP.
+- Outbound IAM is addressed to the **`peer-dpc`** point code and handed to the STP.
 - The **STP** routes the message to whichever exchange owns that point code,
   using its own routing table.
 - The dialled number then selects an **extension within** the terminating
@@ -173,7 +173,7 @@ number alone:
 To route calls between two `mod_isup` exchanges, each must:
 
 1. Have a distinct **OPC** and be registered/`ACTIVE` on the STP.
-2. Set its `ISUP_PEER_DPC` to the other exchange's OPC.
+2. Set its `peer-dpc` to the other exchange's OPC.
 3. Be provisioned on the STP so the STP will route each point code to the correct
    exchange.
 

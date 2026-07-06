@@ -54,7 +54,7 @@ ISUP profile 'lab'
 | `M3UA ASP … : ACTIVE / down` | The ASP name and its M3UA state. **`ACTIVE`** means the exchange can signal; **`down`** means it cannot. |
 | `point codes` | `OPC` = this exchange, `peer DPC` = the destination outbound calls route to, `NI` = network indicator. |
 | `MGW (mgcp)` | The bearer driver and the configured Media Gateway `host:port`. |
-| `SCCP` | Whether the optional SCCP (SI=3) user is bound (`disabled` unless `ISUP_SCCP_SSN` is set). |
+| `SCCP` | Whether the optional SCCP (SI=3) user is bound (`disabled` unless `sccp-ssn` is set). |
 | `circuits` | The CIC range and how many circuits are currently in use (non-idle). |
 
 ### `isup m3ua`
@@ -126,7 +126,7 @@ $ fs_cli -x "isup sccp"
 SCCP (SI=3): disabled
 ```
 
-When enabled (`ISUP_SCCP_SSN` set), it additionally reports the bound Subsystem
+When enabled (`sccp-ssn` > 0), it additionally reports the bound Subsystem
 Number. SCCP shares the same M3UA association as ISUP and is reserved for a
 future TCAP/MAP layer.
 
@@ -148,7 +148,7 @@ $ fs_cli -x "originate isup/lab/1002 &echo"
 shows `mod_isup: osmo setup failed` or `failed to read cs7 config`.
 
 **Possible causes**:
-- The cs7 config file (`ISUP_CS7_CFG`) is missing or has a syntax error.
+- The cs7 config file (`cs7-config`) is missing or has a syntax error.
 - The STP is unreachable, so the ASP could not become ready within the start-up
   window.
 
@@ -163,14 +163,14 @@ shows `mod_isup: osmo setup failed` or `failed to read cs7 config`.
 **Symptoms**: `isup status` shows `M3UA ASP … : down`; calls fail.
 
 **Possible causes**:
-- `ISUP_ASP_NAME` does not match the `asp` name in the cs7 config, so the
+- `asp-name` (isup.conf.xml) does not match the `asp` name in the cs7 config, so the
   association is never started.
 - The STP has not provisioned this exchange (its point code / routing context /
   source IP+port), so it rejects the M3UA ASP after the SCTP association forms.
 - SCTP cannot reach the STP.
 
 **Resolution**:
-1. Ensure `ISUP_ASP_NAME` exactly equals the cs7 `asp` name.
+1. Ensure `asp-name` exactly equals the cs7 `asp` name.
 2. Confirm the STP is provisioned with this exchange's **routing context**,
    **point code**, and the **source IP/port** it will connect from.
 3. Check for an established SCTP association to the STP on port 2905.
