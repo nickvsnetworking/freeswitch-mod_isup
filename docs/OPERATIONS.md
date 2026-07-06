@@ -46,9 +46,12 @@ flowchart LR
     MOD <-->|RTP| MGW
 ```
 
-Each FreeSWITCH instance running `mod_isup` is **one ISUP exchange**, identified
-by its **Originating Point Code (OPC)**. It signals to a peer exchange
-(identified by a **Destination Point Code, DPC**) via the STP.
+A FreeSWITCH instance running `mod_isup` hosts **one or more ISUP profiles** —
+independent trunks (like SIP profiles in `mod_sofia`). All profiles share **one
+M3UA transport** (a single association to the STP); each profile has its own
+**Originating Point Code (OPC)**, **CIC numbering**, and **MGW**, and signals to
+its own peer (a **Destination Point Code, DPC**). Inbound messages are demuxed to
+the profile whose OPC is the message's destination point code.
 
 ## Key Concepts
 
@@ -68,20 +71,18 @@ by its **Originating Point Code (OPC)**. It signals to a peer exchange
 | Load the module | `fs_cli -x "load mod_isup"` |
 | Confirm loaded | `fs_cli -x "module_exists mod_isup"` |
 | Check M3UA / circuit status | `fs_cli -x "isup status"` |
-| Place an ISUP call | `fs_cli -x "originate isup/lab/1002 &echo"` |
+| Place an ISUP call | `fs_cli -x "originate isup/trunk-a/1002 &echo"` |
 
 ## Operating State
 
-`mod_isup` is ready to carry calls only when its M3UA ASP is **ACTIVE**. On a
-healthy exchange, `isup status` reports:
+`mod_isup` is ready to carry calls only when the shared M3UA ASP is **ACTIVE**.
+On a healthy exchange, `isup status` reports the transport and each profile:
 
 ```
-ISUP profile 'lab'
-  M3UA ASP asp-clnt-stp : ACTIVE
-  point codes      : OPC=607  peer DPC=608  NI=2
-  MGW (mgcp)        : 10.179.1.201:2427
-  SCCP             : disabled
-  circuits         : 1-4  (0 in use)
+M3UA ASP asp-clnt-stp : ACTIVE   (2 profile(s))
+SCCP (SI=3)      : disabled
+profile 'trunk-a': OPC=607  peer-DPC=608  NI=2  MGW=10.179.1.201:2427  CIC 1-4 (0 in use)
+profile 'trunk-b': OPC=609  peer-DPC=610  NI=2  MGW=10.179.1.202:2427  CIC 1-8 (0 in use)
 ```
 
 If the ASP shows `down`, no ISUP calls will complete — see

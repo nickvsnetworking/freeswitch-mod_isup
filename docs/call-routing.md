@@ -170,12 +170,17 @@ number alone:
 - The dialled number then selects an **extension within** the terminating
   exchange's `default` context.
 
-To route calls between two `mod_isup` exchanges, each must:
+Profiles are demuxed on receive by **destination point code**: an inbound
+message addressed to a given OPC is handed to the profile that owns that OPC.
 
-1. Have a distinct **OPC** and be registered/`ACTIVE` on the STP.
-2. Set its `peer-dpc` to the other exchange's OPC.
-3. Be provisioned on the STP so the STP will route each point code to the correct
-   exchange.
+To route calls between two ISUP endpoints (whether two profiles on one server or
+two separate servers), each must:
+
+1. Have a distinct **OPC** and share the transport that is registered/`ACTIVE`
+   on the STP.
+2. Set its `peer-dpc` to the other endpoint's OPC.
+3. Be provisioned on the STP so the STP routes each point code to the correct
+   ASP.
 
 See [Configuration Reference](./configuration.md) for point-code and routing
 configuration.

@@ -81,6 +81,7 @@ typedef struct isup_profile {
 	struct osmo_timer_list grs_timer;   /* start-up group reset (Q.764 §2.9.1)  */
 	int                  grs_tries;     /* start-up GRS (re)transmission count   */
 	int                  grs_acked;     /* peer answered our start-up GRS w/ GRA  */
+	int                  autoanswer;    /* demo: answer inbound calls in-module   */
 } isup_profile_t;
 
 #define ISUP_GRS_MAX_TRIES  20          /* bound the start-up GRS retransmits   */
@@ -110,9 +111,13 @@ enum cmd_type { CMD_ORIGINATE, CMD_PROCEEDING, CMD_ANSWER, CMD_HANGUP, CMD_MEDIA
 struct isup_cmd { enum cmd_type type; isup_ckt_t *ckt; uint8_t cause;
 		  uint8_t bci[2]; int bci_set; struct isup_msg iam; };
 
+#define ISUP_MAX_PROFILES 16
 static struct {
 	void                 *tall;
-	isup_profile_t       *profile;     /* single profile for now */
+	isup_profile_t       *profiles[ISUP_MAX_PROFILES]; /* ISUP trunks */
+	int                   nprofiles;
+	struct osmo_ss7_instance *inst;    /* shared M3UA instance (one STP link) */
+	struct osmo_ss7_user *ss7_user;    /* shared SI=5 ISUP user               */
 	switch_thread_t      *osmo_thread;
 	volatile int          running;
 	int                   evfd;
@@ -121,8 +126,7 @@ static struct {
 	volatile unsigned     head, tail;
 	switch_mutex_t       *qlock;
 	switch_memory_pool_t *pool;
-	int                   autoanswer;  /* demo: answer inbound calls in-module */
-	char                  cs7_cfg[256];
+	char                  cs7_cfg[256]; /* shared transport cs7 config path    */
 	volatile int          ready;       /* 1 = osmo thread set up, -1 = failed */
 	int                   sccp_ssn;    /* >0 enables SCCP (SI=3) bound on this SSN */
 	struct osmo_sccp_instance *sccp;
@@ -130,7 +134,27 @@ static struct {
 	char                  asp_name[64];
 } g;
 
-static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg);
+/* Profiles are independent ISUP trunks over the shared M3UA transport, keyed by
+ * name (for outbound dial strings) and by originating point code (to demux
+ * inbound messages by their destination point code). */
+static isup_profile_t *isup_profile_by_name(const char *name)
+{
+	int i;
+	if (!name) return NULL;
+	for (i = 0; i < g.nprofiles; i++)
+		if (!strcasecmp(g.profiles[i]->name, name)) return g.profiles[i];
+	return NULL;
+}
+
+static isup_profile_t *isup_profile_by_opc(uint32_t opc)
+{
+	int i;
+	for (i = 0; i < g.nprofiles; i++)
+		if (g.profiles[i]->m3ua.opc == opc) return g.profiles[i];
+	return NULL;
+}
+
+static int isup_transport_setup(void);
 
 static isup_ckt_t *profile_ckt(isup_profile_t *p, uint16_t cic)
 {
@@ -289,7 +313,7 @@ static void op_fs_setup(void *user, const struct isup_msg *iam)
 	switch_channel_set_caller_profile(pvt->channel, caller);
 	switch_channel_set_state(pvt->channel, CS_INIT);
 
-	if (g.autoanswer) {
+	if (c->profile->autoanswer) {
 		/* Demo path (no dialplan module available): proper flow — send ACM
 		 * (alerting) now, then ANM after a 1.5s ring. CMD_PROCEEDING is
 		 * deferred via the queue (we are inside isup_sm_rx); the ring delay
@@ -410,8 +434,8 @@ static const struct isup_sm_ops ISUP_OPS = {
 
 static int isup_prim_cb(struct osmo_prim_hdr *oph, void *ctx)
 {
-	isup_profile_t *p = ctx;
 	struct osmo_mtp_prim *omp = (struct osmo_mtp_prim *)oph;
+	(void)ctx;
 
 	if (oph->sap == MTP_SAP_USER &&
 	    OSMO_PRIM_HDR(oph) == OSMO_PRIM(OSMO_MTP_PRIM_TRANSFER, PRIM_OP_INDICATION)) {
@@ -419,8 +443,13 @@ static int isup_prim_cb(struct osmo_prim_hdr *oph, void *ctx)
 		const uint8_t *d = msgb_l2(oph->msg);
 		unsigned int n = msgb_l2len(oph->msg);
 		if (d && n && isup_decode(&m, d, n) == ISUP_OK) {
-			isup_ckt_t *c = profile_ckt(p, m.cic);
+			/* Demux to the profile whose OPC is this message's destination
+			 * point code — that is the trunk the message is addressed to. */
+			isup_profile_t *p = isup_profile_by_opc(omp->u.transfer.dpc);
+			isup_ckt_t *c;
 			uint32_t src = omp->u.transfer.opc; /* reply to sender */
+			if (!p) goto drop;
+			c = profile_ckt(p, m.cic);
 			if (c) c->dpc = src;
 			p->cgm_dpc = src;
 
@@ -460,6 +489,7 @@ static int isup_prim_cb(struct osmo_prim_hdr *oph, void *ctx)
 			}
 		}
 	}
+drop:
 	if (oph->msg) msgb_free(oph->msg);
 	return 0;
 }
@@ -486,7 +516,7 @@ static void *SWITCH_THREAD_FUNC osmo_thread_run(switch_thread_t *thread, void *o
 	 * here (the thread that runs osmo_select_main). */
 	osmo_ctx_init("isup");
 	osmo_select_init();
-	if (isup_osmo_setup(g.profile, g.cs7_cfg) < 0) {
+	if (isup_transport_setup() < 0) {
 		g.ready = -1;
 		return NULL;
 	}
@@ -694,7 +724,7 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 		switch_core_session_t **new_session, switch_memory_pool_t **pool,
 		switch_originate_flag_t flags, switch_call_cause_t *cancel_cause)
 {
-	isup_profile_t *profile = g.profile;
+	isup_profile_t *profile = NULL;
 	isup_ckt_t *c = NULL;
 	isup_pvt_t *pvt;
 	switch_core_session_t *nsession;
@@ -705,8 +735,33 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 	const char *number;
 	(void)var_event; (void)cancel_cause;
 
-	if (!profile || !outbound_profile || zstr(outbound_profile->destination_number))
+	if (!outbound_profile || zstr(outbound_profile->destination_number))
 		return SWITCH_CAUSE_INVALID_NUMBER_FORMAT;
+
+	/* Dial string is  isup/<profile>/<number>  — FreeSWITCH hands us
+	 * "<profile>/<number>" as the destination; split off the trunk name. */
+	{
+		const char *dest = outbound_profile->destination_number;
+		const char *slash = strchr(dest, '/');
+		if (slash) {
+			char pname[64];
+			size_t plen = (size_t)(slash - dest);
+			if (plen >= sizeof(pname)) plen = sizeof(pname) - 1;
+			memcpy(pname, dest, plen);
+			pname[plen] = 0;
+			profile = isup_profile_by_name(pname);
+			number = slash + 1;
+		} else {
+			profile = (g.nprofiles == 1) ? g.profiles[0] : NULL;
+			number = dest;
+		}
+	}
+	if (!profile) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"mod_isup: originate to unknown ISUP profile in '%s'\n",
+			outbound_profile->destination_number);
+		return SWITCH_CAUSE_INVALID_NUMBER_FORMAT;
+	}
 
 	/* Q.764 §2.9.1: hold off call origination until the start-up circuit-group
 	 * reset has resolved with the peer; the circuits are not yet known-idle at
@@ -716,9 +771,6 @@ static switch_call_cause_t channel_outgoing_channel(switch_core_session_t *sessi
 			"mod_isup: rejecting originate — start-up group reset not yet complete\n");
 		return SWITCH_CAUSE_NORMAL_TEMPORARY_FAILURE;
 	}
-
-	number = outbound_profile->destination_number;
-	{ const char *slash = strrchr(number, '/'); if (slash) number = slash + 1; }
 
 	for (cic = profile->cic_min; cic <= profile->cic_max; cic++) {
 		isup_ckt_t *cand = profile_ckt(profile, (uint16_t)cic);
@@ -810,58 +862,71 @@ static switch_io_routines_t isup_io_routines = {
 
 static struct osmo_ss7_asp *isup_find_asp(void)
 {
-	if (!g.profile || !g.profile->m3ua.inst || !g.asp_name[0]) return NULL;
+	if (!g.inst || !g.asp_name[0]) return NULL;
 	/* By name, so the ASP's SCTP local (source) port is free to be pinned in
 	 * the cs7 config (needed to run two exchanges off one source IP). */
-	return osmo_ss7_asp_find_by_name(g.profile->m3ua.inst, g.asp_name);
+	return osmo_ss7_asp_find_by_name(g.inst, g.asp_name);
 }
 
 SWITCH_STANDARD_API(isup_api_function)
 {
-	isup_profile_t *p = g.profile;
 	struct osmo_ss7_asp *asp = isup_find_asp();
 	int asp_up = asp && osmo_ss7_asp_active(asp);
 	const char *sub = zstr(cmd) ? "status" : cmd;
-	int i, n = p ? (p->cic_max - p->cic_min + 1) : 0, busy = 0;
+	int pi, i;
 
 	(void)session;
-	if (!p) { stream->write_function(stream, "-ERR mod_isup not ready\n"); return SWITCH_STATUS_SUCCESS; }
-	for (i = 0; i < n; i++) if (p->ckt[i].sm.state != CIC_IDLE) busy++;
+	if (g.nprofiles == 0) { stream->write_function(stream, "-ERR mod_isup not ready\n"); return SWITCH_STATUS_SUCCESS; }
 
 	if (!strcasecmp(sub, "status")) {
-		stream->write_function(stream, "ISUP profile '%s'\n", p->name);
-		stream->write_function(stream, "  M3UA ASP %-8s : %s\n", g.asp_name, asp_up ? "ACTIVE" : "down");
-		stream->write_function(stream, "  point codes      : OPC=%u  peer DPC=%u  NI=%u\n",
-				       p->m3ua.opc, p->peer_dpc, p->m3ua.ni);
-		stream->write_function(stream, "  MGW (%s)        : %s\n",
-				       p->bearer ? p->bearer->name : "-", p->gateway);
-		stream->write_function(stream, "  SCCP             : %s",
-				       g.sccp_ssn ? "enabled" : "disabled");
+		stream->write_function(stream, "M3UA ASP %-8s : %s   (%d profile(s))\n",
+				       g.asp_name, asp_up ? "ACTIVE" : "down", g.nprofiles);
+		stream->write_function(stream, "SCCP (SI=3)      : %s", g.sccp_ssn ? "enabled" : "disabled");
 		if (g.sccp_ssn) stream->write_function(stream, " (SSN=%d)", g.sccp_ssn);
-		stream->write_function(stream, "\n  circuits         : %u-%u  (%d in use)\n",
-				       p->cic_min, p->cic_max, busy);
+		stream->write_function(stream, "\n");
+		for (pi = 0; pi < g.nprofiles; pi++) {
+			isup_profile_t *p = g.profiles[pi];
+			int n = p->cic_max - p->cic_min + 1, busy = 0;
+			for (i = 0; i < n; i++) if (p->ckt[i].sm.state != CIC_IDLE) busy++;
+			stream->write_function(stream,
+				"profile '%s': OPC=%u  peer-DPC=%u  NI=%u  MGW=%s  CIC %u-%u (%d in use)\n",
+				p->name, p->m3ua.opc, p->peer_dpc, p->m3ua.ni, p->gateway,
+				p->cic_min, p->cic_max, busy);
+		}
 	} else if (!strcasecmp(sub, "m3ua")) {
 		stream->write_function(stream, "M3UA ASP %s: %s\n", g.asp_name, asp_up ? "ACTIVE" : "down");
-		stream->write_function(stream, "  local PC (OPC) : %u\n", p->m3ua.opc);
-		stream->write_function(stream, "  peer  PC (DPC) : %u\n", p->peer_dpc);
-		stream->write_function(stream, "  network ind    : %u (national)\n", p->m3ua.ni);
-		stream->write_function(stream, "  cs7 config     : %s\n", g.cs7_cfg);
+		stream->write_function(stream, "  cs7 config : %s\n", g.cs7_cfg);
+		for (pi = 0; pi < g.nprofiles; pi++) {
+			isup_profile_t *p = g.profiles[pi];
+			stream->write_function(stream, "  profile '%s': OPC=%u  peer-DPC=%u  NI=%u\n",
+					       p->name, p->m3ua.opc, p->peer_dpc, p->m3ua.ni);
+		}
 	} else if (!strcasecmp(sub, "mgw")) {
-		stream->write_function(stream, "MGW %s  driver=%s\n", p->gateway, p->bearer ? p->bearer->name : "-");
-		for (i = 0; i < n; i++) {
-			isup_ckt_t *c = &p->ckt[i];
-			if (c->mgw_rtp_port || c->sm.state != CIC_IDLE)
-				stream->write_function(stream, "  CIC %-3u  ep=%-16s  MGW-RTP=%s:%u  FS-RTP=%s:%u\n",
-						       c->cic, c->mgw_endpoint, c->mgw_rtp_ip, c->mgw_rtp_port,
-						       c->fs_rtp_ip[0] ? c->fs_rtp_ip : "-", c->fs_rtp_port);
+		for (pi = 0; pi < g.nprofiles; pi++) {
+			isup_profile_t *p = g.profiles[pi];
+			int n = p->cic_max - p->cic_min + 1;
+			stream->write_function(stream, "profile '%s'  MGW %s  driver=%s\n",
+					       p->name, p->gateway, p->bearer ? p->bearer->name : "-");
+			for (i = 0; i < n; i++) {
+				isup_ckt_t *c = &p->ckt[i];
+				if (c->mgw_rtp_port || c->sm.state != CIC_IDLE)
+					stream->write_function(stream, "  CIC %-3u  ep=%-16s  MGW-RTP=%s:%u  FS-RTP=%s:%u\n",
+							       c->cic, c->mgw_endpoint, c->mgw_rtp_ip, c->mgw_rtp_port,
+							       c->fs_rtp_ip[0] ? c->fs_rtp_ip : "-", c->fs_rtp_port);
+			}
 		}
 	} else if (!strcasecmp(sub, "cic")) {
-		stream->write_function(stream, "%-5s %-15s %-7s %s\n", "CIC", "state", "session", "MGW-RTP");
-		for (i = 0; i < n; i++) {
-			isup_ckt_t *c = &p->ckt[i];
-			stream->write_function(stream, "%-5u %-15s %-7s %s:%u\n",
-					       c->cic, isup_state_name(c->sm.state),
-					       c->session ? "yes" : "-", c->mgw_rtp_ip, c->mgw_rtp_port);
+		for (pi = 0; pi < g.nprofiles; pi++) {
+			isup_profile_t *p = g.profiles[pi];
+			int n = p->cic_max - p->cic_min + 1;
+			stream->write_function(stream, "profile '%s':\n", p->name);
+			stream->write_function(stream, "  %-5s %-15s %-7s %s\n", "CIC", "state", "session", "MGW-RTP");
+			for (i = 0; i < n; i++) {
+				isup_ckt_t *c = &p->ckt[i];
+				stream->write_function(stream, "  %-5u %-15s %-7s %s:%u\n",
+						       c->cic, isup_state_name(c->sm.state),
+						       c->session ? "yes" : "-", c->mgw_rtp_ip, c->mgw_rtp_port);
+			}
 		}
 	} else if (!strcasecmp(sub, "sccp")) {
 		stream->write_function(stream, "SCCP (SI=3): %s\n", g.sccp_ssn ? "enabled" : "disabled");
@@ -881,63 +946,14 @@ SWITCH_STANDARD_API(isup_api_function)
 static const struct log_info g_log_info = { .cat = NULL, .num_cat = 0 };
 static struct vty_app_info g_vty_info = { .name = "mod_isup", .version = "0" };
 
-static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
+/* Bring up one profile's circuits, timers, circuit-group manager and start-up
+ * group reset over the already-established shared transport. */
+static void isup_profile_bring_up(isup_profile_t *p)
 {
-	struct osmo_ss7_instance *inst;
-	struct osmo_ss7_user *user;
 	int i, t;
 
-	g.tall = talloc_named_const(NULL, 0, "mod_isup");
-	osmo_init_logging2(g.tall, &g_log_info);
-	osmo_ss7_init();
-	vty_init(&g_vty_info);
-	logging_vty_add_cmds();
-	osmo_ss7_vty_init_sg(g.tall); /* superset of _asp; adds route-table/listen */
-	if (vty_read_config_file(cs7_cfg, NULL) < 0) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-				  "mod_isup: failed to read cs7 config %s\n", cs7_cfg);
-		return -1;
-	}
-	inst = osmo_ss7_instance_find(0);
-	if (!inst) return -1;
-
-	/* Kick the configured (client) ASP into connecting to the STP. */
-	{
-		const char *aspname = g.asp_name[0] ? g.asp_name : NULL;
-		if (aspname) {
-			struct osmo_ss7_asp *asp =
-				osmo_ss7_asp_find_by_name(inst, aspname);
-			if (asp)
-				osmo_ss7_asp_restart(asp);
-		}
-	}
-
-	/* osmo_ss7_user is a caller-owned struct: allocate it, fill it, and
-	 * register it against the instance for the ISUP service indicator (SI=5). */
-	user = talloc_zero(g.tall, struct osmo_ss7_user);
-	if (!user) return -1;
-	user->inst = inst;
-	user->name = "isup";
-	user->prim_cb = isup_prim_cb;
-	user->priv = p;
-	osmo_ss7_user_register(inst, MTP_SI_ISUP, user);
-
-	p->m3ua.inst = inst;
-	p->m3ua.ss7_user = user;
-
-	/* Optional SCCP (SI=3) on the same M3UA association — reserved for a
-	 * future TCAP/MAP/INAP layer. Enabled only when an SSN is configured. */
-	if (g.sccp_ssn > 0) {
-		g.sccp = osmo_ss7_ensure_sccp(inst);
-		if (g.sccp) {
-			g.sccp_user = osmo_sccp_user_bind(g.sccp, "isup-sccp",
-							  isup_sccp_prim_cb, (uint16_t)g.sccp_ssn);
-			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-					  "mod_isup: SCCP enabled (SI=3, SSN=%d)\n", g.sccp_ssn);
-			fprintf(stderr, "mod_isup: SCCP enabled (SI=3, SSN=%d, user=%p)\n",
-				g.sccp_ssn, (void *)g.sccp_user);
-		}
-	}
+	p->m3ua.inst = g.inst;
+	p->m3ua.ss7_user = g.ss7_user;
 
 	for (i = 0; i < (p->cic_max - p->cic_min + 1); i++) {
 		isup_ckt_t *c = &p->ckt[i];
@@ -958,6 +974,62 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 	isup_cgm_init(&p->cgm, p->cic_min, p->cic_max - p->cic_min + 1, &CGM_OPS, p);
 	osmo_timer_setup(&p->grs_timer, startup_grs_cb, p);
 	osmo_timer_schedule(&p->grs_timer, ISUP_GRS_RETRY_S, 0); /* once ASP is up */
+}
+
+/* Establish the shared M3UA transport (one instance / ASP / SI=5 user for the
+ * whole module), then bring up every configured profile over it. */
+static int isup_transport_setup(void)
+{
+	struct osmo_ss7_instance *inst;
+	struct osmo_ss7_user *user;
+	int pi;
+
+	g.tall = talloc_named_const(NULL, 0, "mod_isup");
+	osmo_init_logging2(g.tall, &g_log_info);
+	osmo_ss7_init();
+	vty_init(&g_vty_info);
+	logging_vty_add_cmds();
+	osmo_ss7_vty_init_sg(g.tall); /* superset of _asp; adds route-table/listen */
+	if (vty_read_config_file(g.cs7_cfg, NULL) < 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+				  "mod_isup: failed to read cs7 config %s\n", g.cs7_cfg);
+		return -1;
+	}
+	inst = osmo_ss7_instance_find(0);
+	if (!inst) return -1;
+	g.inst = inst;
+
+	/* Kick the configured (client) ASP into connecting to the STP. */
+	if (g.asp_name[0]) {
+		struct osmo_ss7_asp *asp = osmo_ss7_asp_find_by_name(inst, g.asp_name);
+		if (asp) osmo_ss7_asp_restart(asp);
+	}
+
+	/* One shared SI=5 ISUP user for the transport; the prim_cb demuxes inbound
+	 * messages to the owning profile by destination point code. */
+	user = talloc_zero(g.tall, struct osmo_ss7_user);
+	if (!user) return -1;
+	user->inst = inst;
+	user->name = "isup";
+	user->prim_cb = isup_prim_cb;
+	user->priv = &g;
+	osmo_ss7_user_register(inst, MTP_SI_ISUP, user);
+	g.ss7_user = user;
+
+	/* Optional SCCP (SI=3) on the same association — reserved for a future
+	 * TCAP/MAP/INAP layer. Enabled only when an SSN is configured. */
+	if (g.sccp_ssn > 0) {
+		g.sccp = osmo_ss7_ensure_sccp(inst);
+		if (g.sccp) {
+			g.sccp_user = osmo_sccp_user_bind(g.sccp, "isup-sccp",
+							  isup_sccp_prim_cb, (uint16_t)g.sccp_ssn);
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+					  "mod_isup: SCCP enabled (SI=3, SSN=%d)\n", g.sccp_ssn);
+		}
+	}
+
+	for (pi = 0; pi < g.nprofiles; pi++)
+		isup_profile_bring_up(g.profiles[pi]);
 
 	/* eventfd for FS -> Osmo marshalling, registered in the select loop */
 	g.evfd = eventfd(0, EFD_NONBLOCK);
@@ -969,67 +1041,109 @@ static int isup_osmo_setup(isup_profile_t *p, const char *cs7_cfg)
 /* Load settings from autoload_configs/isup.conf.xml. The XML file is the
  * canonical configuration; same-named ISUP_* environment variables override it
  * (convenient for containerised deployments). */
-static void isup_load_config(isup_profile_t *p)
+static void isup_parse_profile_param(isup_profile_t *p, const char *var, const char *val)
 {
-	switch_xml_t xml, cfg, settings, param;
-	const char *cs7 = NULL, *asp = NULL, *mgw = NULL, *ctx = NULL, *dp = NULL, *name = NULL;
-	const char *env;
+	if      (!strcasecmp(var, "opc"))               p->m3ua.opc = (uint32_t)atoi(val);
+	else if (!strcasecmp(var, "peer-dpc"))          p->peer_dpc = (uint32_t)atoi(val);
+	else if (!strcasecmp(var, "network-indicator")) p->m3ua.ni  = (uint8_t)atoi(val);
+	else if (!strcasecmp(var, "mgw"))               switch_copy_string(p->gateway, val, sizeof(p->gateway));
+	else if (!strcasecmp(var, "cic-min"))           p->cic_min  = (uint16_t)atoi(val);
+	else if (!strcasecmp(var, "cic-max"))           p->cic_max  = (uint16_t)atoi(val);
+	else if (!strcasecmp(var, "context"))           switch_copy_string(p->context, val, sizeof(p->context));
+	else if (!strcasecmp(var, "dialplan"))          switch_copy_string(p->dialplan, val, sizeof(p->dialplan));
+	else if (!strcasecmp(var, "auto-answer"))       p->autoanswer = switch_true(val);
+}
 
+static isup_profile_t *isup_new_profile(const char *name)
+{
+	isup_profile_t *p = switch_core_alloc(g.pool, sizeof(*p));
+	switch_copy_string(p->name, name, sizeof(p->name));
 	p->m3ua.opc = 1;
 	p->peer_dpc = 2;
 	p->m3ua.ni  = 2;               /* national */
 	p->cic_min  = 1;
 	p->cic_max  = 4;
-	g.autoanswer = 0;
-	g.sccp_ssn   = 0;
+	p->autoanswer = 0;
+	switch_copy_string(p->gateway,  "127.0.0.1:2427", sizeof(p->gateway));
+	switch_copy_string(p->context,  "default", sizeof(p->context));
+	switch_copy_string(p->dialplan, "XML", sizeof(p->dialplan));
+	return p;
+}
+
+/* Load the shared transport <settings> and the ISUP <profiles> from
+ * isup.conf.xml. ISUP_* environment variables override the shared transport
+ * settings; when exactly one profile is defined, the identity env vars
+ * (ISUP_OPC / ISUP_PEER_DPC / ISUP_MGW / ISUP_AUTOANSWER) override it too, for
+ * containerised single-exchange deployments. */
+static void isup_load_configs(void)
+{
+	switch_xml_t xml, cfg, settings, profiles, xprof, param;
+	const char *cs7 = NULL, *asp = NULL, *env;
+	int i;
+
+	g.sccp_ssn = 0;
+	g.nprofiles = 0;
 
 	if ((xml = switch_xml_open_cfg("isup.conf", &cfg, NULL))) {
 		if ((settings = switch_xml_child(cfg, "settings"))) {
 			for (param = switch_xml_child(settings, "param"); param; param = param->next) {
 				const char *var = switch_xml_attr_soft(param, "name");
 				const char *val = switch_xml_attr_soft(param, "value");
-				if      (!strcasecmp(var, "profile-name"))      name = val;
-				else if (!strcasecmp(var, "cs7-config"))        cs7  = val;
-				else if (!strcasecmp(var, "asp-name"))          asp  = val;
-				else if (!strcasecmp(var, "opc"))               p->m3ua.opc = (uint32_t)atoi(val);
-				else if (!strcasecmp(var, "peer-dpc"))          p->peer_dpc = (uint32_t)atoi(val);
-				else if (!strcasecmp(var, "mgw"))               mgw  = val;
-				else if (!strcasecmp(var, "network-indicator")) p->m3ua.ni = (uint8_t)atoi(val);
-				else if (!strcasecmp(var, "cic-min"))           p->cic_min = (uint16_t)atoi(val);
-				else if (!strcasecmp(var, "cic-max"))           p->cic_max = (uint16_t)atoi(val);
-				else if (!strcasecmp(var, "context"))           ctx  = val;
-				else if (!strcasecmp(var, "dialplan"))          dp   = val;
-				else if (!strcasecmp(var, "auto-answer"))       g.autoanswer = switch_true(val);
-				else if (!strcasecmp(var, "sccp-ssn"))          g.sccp_ssn = atoi(val);
+				if      (!strcasecmp(var, "asp-name"))   asp = val;
+				else if (!strcasecmp(var, "cs7-config")) cs7 = val;
+				else if (!strcasecmp(var, "sccp-ssn"))   g.sccp_ssn = atoi(val);
+			}
+		}
+		if ((profiles = switch_xml_child(cfg, "profiles"))) {
+			for (xprof = switch_xml_child(profiles, "profile"); xprof; xprof = xprof->next) {
+				const char *pname = switch_xml_attr_soft(xprof, "name");
+				isup_profile_t *p;
+				if (zstr(pname) || g.nprofiles >= ISUP_MAX_PROFILES) continue;
+				p = isup_new_profile(pname);
+				for (param = switch_xml_child(xprof, "param"); param; param = param->next)
+					isup_parse_profile_param(p, switch_xml_attr_soft(param, "name"),
+								 switch_xml_attr_soft(param, "value"));
+				g.profiles[g.nprofiles++] = p;
 			}
 		}
 		switch_xml_free(xml);
 	} else {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-				  "mod_isup: isup.conf.xml not found; using defaults + environment\n");
+				  "mod_isup: isup.conf.xml not found; using a default profile + environment\n");
 	}
 
+	/* Shared transport: environment overrides */
 	if ((env = getenv("ISUP_CS7_CFG")))  cs7 = env;
 	if ((env = getenv("ISUP_ASP_NAME"))) asp = env;
-	if ((env = getenv("ISUP_MGW")))      mgw = env;
-	if ((env = getenv("ISUP_OPC")))      p->m3ua.opc = (uint32_t)atoi(env);
-	if ((env = getenv("ISUP_PEER_DPC"))) p->peer_dpc = (uint32_t)atoi(env);
-	if (getenv("ISUP_AUTOANSWER"))       g.autoanswer = 1;
 	if ((env = getenv("ISUP_SCCP_SSN"))) g.sccp_ssn = atoi(env);
+	switch_copy_string(g.asp_name, asp ? asp : "asp", sizeof(g.asp_name));
+	switch_copy_string(g.cs7_cfg,  cs7 ? cs7 : "/usr/local/freeswitch/conf/isup-cs7.cfg", sizeof(g.cs7_cfg));
 
-	switch_copy_string(p->name,     name ? name : "lab", sizeof(p->name));
-	switch_copy_string(g.asp_name,  asp ? asp : "asp", sizeof(g.asp_name));
-	switch_copy_string(g.cs7_cfg,   cs7 ? cs7 : "/usr/local/freeswitch/conf/isup-cs7.cfg", sizeof(g.cs7_cfg));
-	switch_copy_string(p->gateway,  mgw ? mgw : "127.0.0.1:2427", sizeof(p->gateway));
-	switch_copy_string(p->context,  ctx ? ctx : "default", sizeof(p->context));
-	switch_copy_string(p->dialplan, dp ? dp : "XML", sizeof(p->dialplan));
-	if (p->cic_max < p->cic_min) p->cic_max = p->cic_min;
+	/* No <profiles> configured: synthesise one (env/defaults, container use). */
+	if (g.nprofiles == 0)
+		g.profiles[g.nprofiles++] = isup_new_profile(getenv("ISUP_PROFILE") ? getenv("ISUP_PROFILE") : "lab");
+
+	/* Single-profile identity env overrides (containerised single exchange). */
+	if (g.nprofiles == 1) {
+		isup_profile_t *p = g.profiles[0];
+		if ((env = getenv("ISUP_OPC")))      p->m3ua.opc = (uint32_t)atoi(env);
+		if ((env = getenv("ISUP_PEER_DPC"))) p->peer_dpc = (uint32_t)atoi(env);
+		if ((env = getenv("ISUP_MGW")))      switch_copy_string(p->gateway, env, sizeof(p->gateway));
+		if (getenv("ISUP_AUTOANSWER"))       p->autoanswer = 1;
+	}
+
+	/* Finalise each profile: bearer driver + circuit array. */
+	for (i = 0; i < g.nprofiles; i++) {
+		isup_profile_t *p = g.profiles[i];
+		if (p->cic_max < p->cic_min) p->cic_max = p->cic_min;
+		p->bearer = bearer_mgcp_driver();
+		p->ckt = switch_core_alloc(g.pool, sizeof(isup_ckt_t) * (p->cic_max - p->cic_min + 1));
+	}
 }
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 {
 	switch_endpoint_interface_t *ep;
-	isup_profile_t *p;
 
 	memset(&g, 0, sizeof(g));
 	g.pool = pool;
@@ -1051,12 +1165,9 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 		switch_console_set_complete("add isup sccp");
 	}
 
-	/* Configuration from autoload_configs/isup.conf.xml (ISUP_* env overrides). */
-	p = switch_core_alloc(pool, sizeof(*p));
-	g.profile = p;
-	isup_load_config(p);
-	p->bearer = bearer_mgcp_driver();
-	p->ckt = switch_core_alloc(pool, sizeof(isup_ckt_t) * (p->cic_max - p->cic_min + 1));
+	/* Configuration from autoload_configs/isup.conf.xml (shared transport +
+	 * one or more ISUP trunk profiles). */
+	isup_load_configs();
 
 	/* Launch the Osmo thread; it performs all osmo setup then runs the loop.
 	 * Wait (briefly) until it signals ready so outbound calls find state. */
@@ -1076,9 +1187,19 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_isup_load)
 		return SWITCH_STATUS_FALSE;
 	}
 
-	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
-			  "mod_isup loaded: profile '%s' CIC %u-%u, MGW %s\n",
-			  p->name, p->cic_min, p->cic_max, p->gateway);
+	{
+		int i;
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+				  "mod_isup loaded: %d profile(s) over ASP '%s'\n",
+				  g.nprofiles, g.asp_name);
+		for (i = 0; i < g.nprofiles; i++) {
+			isup_profile_t *p = g.profiles[i];
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+					  "  profile '%s': OPC=%u peer-DPC=%u CIC %u-%u MGW %s\n",
+					  p->name, p->m3ua.opc, p->peer_dpc,
+					  p->cic_min, p->cic_max, p->gateway);
+		}
+	}
 	return SWITCH_STATUS_SUCCESS;
 }
 

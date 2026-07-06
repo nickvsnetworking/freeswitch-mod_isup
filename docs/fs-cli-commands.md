@@ -36,26 +36,24 @@ isup status | m3ua | mgw | cic | sccp
 
 ### `isup status`
 
-Overall health of the exchange — the first thing to check.
+Overall health — the shared transport followed by one line per profile.
 
 ```
 $ fs_cli -x "isup status"
-ISUP profile 'lab'
-  M3UA ASP asp-clnt-stp : ACTIVE
-  point codes      : OPC=607  peer DPC=608  NI=2
-  MGW (mgcp)        : 10.179.1.201:2427
-  SCCP             : disabled
-  circuits         : 1-4  (0 in use)
+M3UA ASP asp-clnt-stp : ACTIVE   (2 profile(s))
+SCCP (SI=3)      : disabled
+profile 'trunk-a': OPC=607  peer-DPC=608  NI=2  MGW=10.179.1.201:2427  CIC 1-4 (0 in use)
+profile 'trunk-b': OPC=609  peer-DPC=610  NI=2  MGW=10.179.1.202:2427  CIC 1-8 (0 in use)
 ```
 
 | Field | Meaning |
 |-------|---------|
-| `ISUP profile` | The profile name (`lab`). |
-| `M3UA ASP … : ACTIVE / down` | The ASP name and its M3UA state. **`ACTIVE`** means the exchange can signal; **`down`** means it cannot. |
-| `point codes` | `OPC` = this exchange, `peer DPC` = the destination outbound calls route to, `NI` = network indicator. |
-| `MGW (mgcp)` | The bearer driver and the configured Media Gateway `host:port`. |
-| `SCCP` | Whether the optional SCCP (SI=3) user is bound (`disabled` unless `sccp-ssn` is set). |
-| `circuits` | The CIC range and how many circuits are currently in use (non-idle). |
+| `M3UA ASP … : ACTIVE / down` | The shared ASP name and its M3UA state, plus the number of configured profiles. **`ACTIVE`** means the exchange can signal; **`down`** means it cannot. |
+| `SCCP (SI=3)` | Whether the optional SCCP user is bound (`disabled` unless `sccp-ssn` is set). |
+| `profile '…'` | One line per trunk: its `OPC`, `peer-DPC`, network indicator `NI`, `MGW`, CIC range, and how many circuits are currently in use. |
+
+The `m3ua`, `mgw`, and `cic` subcommands likewise report the shared transport and
+then break the detail down **per profile**.
 
 ### `isup m3ua`
 

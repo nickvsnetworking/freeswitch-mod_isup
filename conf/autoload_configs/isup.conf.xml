@@ -1,28 +1,42 @@
 <configuration name="isup.conf" description="ISUP-over-M3UA MGCF">
-  <settings>
-    <!-- Exchange identity -->
-    <param name="profile-name" value="lab"/>
-    <param name="opc" value="1"/>
-    <param name="peer-dpc" value="2"/>
-    <param name="network-indicator" value="2"/>
 
-    <!-- M3UA transport. asp-name MUST match the 'asp' name in the cs7 config. -->
+  <!-- Shared M3UA transport to the STP: one SCTP association / ASP for all
+       profiles. asp-name MUST match the 'asp' name in the cs7 config. -->
+  <settings>
     <param name="asp-name" value="asp-clnt-stp"/>
     <param name="cs7-config" value="/usr/local/freeswitch/conf/isup-cs7.cfg"/>
-
-    <!-- Media gateway (MGCP), host:port -->
-    <param name="mgw" value="127.0.0.1:2427"/>
-
-    <!-- Circuit (CIC) range -->
-    <param name="cic-min" value="1"/>
-    <param name="cic-max" value="4"/>
-
-    <!-- Inbound calls are routed here -->
-    <param name="context" value="default"/>
-    <param name="dialplan" value="XML"/>
-
-    <!-- Optional behaviour -->
-    <param name="auto-answer" value="false"/>
     <param name="sccp-ssn" value="0"/>
   </settings>
+
+  <!-- One or more ISUP trunk profiles over that shared transport. Each profile
+       has its own point codes, CIC numbering, and MGW, and is dialled as
+       isup/<profile-name>/<number>. Inbound messages are demuxed to the profile
+       whose OPC is the message's destination point code. -->
+  <profiles>
+    <profile name="trunk-a">
+      <param name="opc" value="607"/>
+      <param name="peer-dpc" value="608"/>
+      <param name="network-indicator" value="2"/>
+      <param name="mgw" value="10.179.1.201:2427"/>
+      <param name="cic-min" value="1"/>
+      <param name="cic-max" value="4"/>
+      <param name="context" value="default"/>
+      <param name="dialplan" value="XML"/>
+      <param name="auto-answer" value="false"/>
+    </profile>
+
+    <!-- A second, independent trunk (own point codes, CICs, MGW):
+    <profile name="trunk-b">
+      <param name="opc" value="609"/>
+      <param name="peer-dpc" value="610"/>
+      <param name="network-indicator" value="2"/>
+      <param name="mgw" value="10.179.1.202:2427"/>
+      <param name="cic-min" value="1"/>
+      <param name="cic-max" value="8"/>
+      <param name="context" value="default"/>
+      <param name="dialplan" value="XML"/>
+    </profile>
+    -->
+  </profiles>
+
 </configuration>
